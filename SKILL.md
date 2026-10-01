@@ -84,6 +84,46 @@ window.navigate(url.parse()?)?;   // url = http://127.0.0.1:<动态端口>
 （`additionalBrowserArgs` 是运行时配置，不在主 exe 字符串里），
 要查的是**安装目录里有没有 wwwroot 目录**。
 
+### 1c. 两套前端产物：**两份都构建**，再把"等价"当断言去校验
+
+只要前端同时要服务「浏览器直连后端」和「打包进桌面端」，就存在**同一份源码、两个输出目录**：
+
+| 链路 | 产物目录 | 构建命令 |
+|---|---|---|
+| 后端静态托管（浏览器访问，同源 API） | `Backend/wwwroot` | `vite build`（默认模式） |
+| 桌面端（`bundle.resources` / 热替换） | `Frontend/dist` | `vite build --mode desktop` |
+
+**别用「构建一次再复制」来省事**，除非你确认两套产物确实等价。判断依据只有两条：
+源码里**有没有用 `import.meta.env` / `process.env`**，以及**环境判定是不是运行期**做的
+（例如 `'__TAURI_INTERNALS__' in window`）。这两条一旦变化，两套产物就会**合法地分叉**，
+复制会悄悄给其中一条链路塞错产物。
+
+更稳的做法：**两套各按自己的 mode 构建**，然后把"等价"当断言去校验：
+
+```bash
+npm --prefix Frontend run build:desktop   # -> Frontend/dist
+npm --prefix Frontend run build           # -> Backend/wwwroot
+```
+
+校验 = 两个目录的**文件名集合 + 每个文件的 md5** 对一遍，不一致直接非零退出。要点：
+
+- **挂进每次构建**（统一走 `build_all.py` 之类），而不是写进文档靠人记得手动跑
+  —— 实际发生过 `wwwroot` 落后 `dist` **15 天**、浏览器直连后端看到旧界面的事故。
+- 另留一个**只校验不构建**的入口，改完产物后好快速复查。
+- **务必做反例验证**：手动加一个多出来的文件、再改一个文件的内容，
+  确认两种偏差都能被检出。**从不报警的检查器等于没测过。**
+- 报告输出用 `OK`/`x`/`!`，别用 `✓`/`✗` —— 非 GBK 字符在管道里会 `UnicodeEncodeError`。
+
+配套的必知坑：**`dotnet build` 不把 `wwwroot` 复制到 `bin/`**（只有 `dotnet publish` 才复制）。
+所以直接跑 `bin/Release/net8.0/Backend.exe` 会**页面 404** —— 要验证"后端托管的界面是不是新的"，
+必须以**后端项目目录为 cwd** 启动（ContentRoot 才指向项目里的 `wwwroot`），或跑 `publish/` 那一份。
+想刷新 `publish/wwwroot` 时**只拷 `wwwroot`，别重跑 publish**：重跑会换掉 exe，
+破坏「publish 产物 md5 == sidecar 二进制 md5」这条在用的不变量。
+
+验证手法：起一次后端，断言 `GET /` 200 且**引用新产物的 hash 文件名**、
+**旧产物的 hash 名返回 404**、静态资源的字节数与本地文件一致。
+看文件时间戳不算数 —— 要 ASP.NET Core 自己把文件吐出来才算。
+
 ### 2. 整理成最小文件集
 
 发布目录里通常有这些**不需要**的东西，删掉可让安装目录干净：
