@@ -271,6 +271,49 @@ pfrom = "\0".join(paths) + "\0\0"
 而 `Microsoft.VisualBasic.FileIO.FileSystem` 也未默认加载 —— 别在那条路上耗时间。
 送回收站**不等于释放空间**：要真正腾出磁盘得清空回收站，收尾时提醒用户一句。
 
+### 6d. 应用自己的**持久数据**绝不能落在安装目录里
+
+Tauri NSIS 的安装目录由 `productName` 决定，默认就是 `%LOCALAPPDATA%\<productName>`。
+这个位置**看起来**很像该放应用数据的地方（`%LOCALAPPDATA%` 本来就是放用户数据的地方），
+于是很容易顺手把密钥 / 证书 / 本地库写进安装目录里 —— **这是错的**：
+
+- 卸载器删完清单文件后还会尝试 `RMDir "$INSTDIR"`。目录空得下来时，**它会连同你的数据一起消失**。
+  实测一次干净的卸载（目录里没有 `.bak` 之类的额外文件）之后，安装目录被**完全清空**。
+- 更常见的中间状态是：目录里只剩你那份数据、其余文件都被删了 —— 它变成"空楼里孤零零一个文件"，
+  此后任何"清理安装残留"的操作（这类脚本/工具很常见）都会顺手带走它。
+- 覆盖安装时，你的数据与安装器要写的文件混在同一层，边界也不清晰。
+
+⇒ 数据目录**取同级但不同名**的路径：app 装 `%LOCALAPPDATA%\MyApp`，数据放 `%LOCALAPPDATA%\MyAppData\`。
+这样安装、卸载、清残留都碰不到它。实测做法：把密钥文件从 `%LOCALAPPDATA%\<productName>\key.dat`
+搬到 `%LOCALAPPDATA%\<productName>Data\key.dat` 后，**卸载 + 覆盖安装全程 md5 未变**。
+
+若旧版本已经发布过，就得带**一次性搬迁**（老位置有、新位置无则搬过去，搬完删老文件），
+并且搬迁入口要有**守卫**：目标不是默认位置、用户也没显式指定老位置时不要搬 ——
+否则"指向临时目录"的自动化测试会把真实数据复制进测试环境，
+让"首次生成"这类断言**静默失效**（测试反而更绿）。
+
+### 6e. 覆盖安装的完整验证循环（全部放在一次进程内）
+
+「卸载 → 安装 → 启动 → 查产物」四步都别指望 shell：
+
+```python
+Popen([uninstall_exe, "/S"], cwd=install_dir).wait()      # 见坑 1：必须同进程
+wait_until(lambda: not os.path.exists(install_dir + r"\sidecar.exe"), 90)
+Popen([setup_exe, "/S"]).wait()
+wait_until(lambda: os.path.exists(install_dir + r"\sidecar.exe"), 120)
+```
+
+- **别用固定 sleep 判断完成**：Tauri 的 NSIS 安装器/卸载器会先把自身复制到 `%TEMP%` 再重启执行，
+  因此**原进程立刻返回 0**，真正的工作还在后面。轮询"产物出现/消失"才可靠。
+- 卸载后目录可能**整个消失**，下一次 `listdir` 会抛 `FileNotFoundError` ⇒ 用 `try/except` 包住。
+- 验证"程序真的活着"看三件事：桌面壳进程在不在、`tasklist` 里有没有 sidecar、
+  再用 `netstat -ano` 按 sidecar 的 PID 找到它监听的 `127.0.0.1:<随机端口>`，
+  对该端口发一次 HTTP GET（200 且响应含前端挂载点）。
+  **后端起得来本身就是强证据** —— 对 fail-closed 的程序（如 pepper 缺失即退出 1），
+  只要它在监听，就说明关键配置都已加载成功。
+- 启动 GUI 要带 `creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`，
+  否则脚本退出会把它一起带走。
+
 ### 7. 免重装热替换（改代码后要立刻在真机验证时的快路径）
 
 只改后端 / 前端时**不必重打安装包**：把新 exe 覆盖到安装目录的 sidecar 位置、
