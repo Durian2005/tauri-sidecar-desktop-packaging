@@ -440,6 +440,33 @@ else:
 **用裸 `socket.create_connection` 发 HTTP/1.1 请求最稳**（记得带 `Content-Length`，
 并处理 `Transfer-Encoding: chunked` 响应）。
 
+### 8. sidecar 走 HTTPS 之后，界面级验证要改的三处
+
+打包好的程序里 sidecar 一旦启用 TLS（`--urls https://127.0.0.1:<随机端口>`），
+原先那套"拿到端口就发 http 请求"的验证会**以误导人的方式失败**，务必改这三处：
+
+1. **取到端口后必须沿用页面 URL 的 scheme**，不能写死 `http://`。
+   用 `http` 去打 `https` 端口只会得到连接重置 / `RemoteDisconnected`，
+   症状极像"后端没起来"，很容易白查半天。页面地址从 CDP 的 `/json/list` 里取，
+   `url.split('//')[0]` 就是它当前真实的 scheme（sidecar 可能被配置降级成明文）。
+2. **"不带信任锚必须失败"这条断言会变成假阳性。**
+   自签 CA 一旦写进系统根存储（生产路径就是这么做的），
+   `ssl.create_default_context()` 会把这张 CA 也读进来 ⇒ 不带 `cacert` 照样连得上。
+   正确的两条对照必须**分开**：
+   - **B** 信任锚为空的上下文（或只加载 `server.crt`）→ 必须失败（证明真在验链，不是装饰）；
+   - **E** 默认上下文（= Schannel / WebView2 真正走的判定路径）→ 必须成功（证明界面能渲染）。
+
+   混在一起写，就得到一条"怎么都通过"的断言。另：Windows 自带 curl 是 **Schannel 后端**，
+   `--cacert` 不足以让它信任自签 CA ⇒ 这套断言请用 Python(OpenSSL) 实现。
+3. **徽记 / 状态类断言要先轮询等它落定，再采样。**
+   界面上的"已连接 / 加密"来自一次异步请求，页面刚挂载时还没回来 ——
+   直接断言会得到"有时过有时不过"的假阴性，而错误结论会被当成功能缺陷去查。
+   实测：修好后徽记 0ms 就在；但没加等待时**第一次跑就误报过一次**。
+
+> 顺带一条界面设计上的坑：这类"链路状态"徽记若只挂在**业务请求成功后的回调**里，
+> 就会等到登录成功才显示 —— 而登录本身就走在这条链路上，
+> 最需要提示的时刻反而空着。应当在启动探活成功后单独取一次（该接口要设计成**匿名可取**）。
+
 ---
 
 ## 三、GUI 程序的一个隐形陷阱
@@ -473,6 +500,19 @@ MSYS_NO_PATHCONV=1 C:/Users/<user>/python.exe <脚本或 -c "...">
 | dotnet | `C:\Program Files\dotnet\dotnet.exe` |
 | node / npm | `C:\Users\<user>\.workbuddy\binaries\node\versions\<ver>\node.exe` / `npm.CMD` |
 | 系统 Python（装过 pymongo 等第三方库） | `C:\Users\<user>\python.exe` |
+| Rust 工具链（cargo / rustc） | `C:\Users\<user>\.cargo\bin\cargo.exe`（可能**没装 rustup**，bin 下直接是 cargo.exe / rustc.exe） |
+
+**`tauri build` 报 `failed to run 'cargo metadata' ... program not found`** ⇒
+就是 cargo 不在 PATH 里。两条容易白折腾的点：
+
+- 若装的是**独立工具链**（`.cargo/bin` 下直接躺着 cargo.exe，没有 `.rustup` 目录），
+  它**不会自动进 PATH**，得自己加。
+- Git Bash 里**别用 `C:\Users\...` 这种反斜杠写法**拼 PATH —— MSYS 解析不了，
+  `command not found` 照旧。要用 `/c/Users/<user>/.cargo/bin`：
+
+```bash
+export PATH="/c/Users/<user>/.cargo/bin:$PATH" && npm run build
+```
 
 两条容易踩的纪律：
 
